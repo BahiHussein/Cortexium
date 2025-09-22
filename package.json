@@ -1,0 +1,36 @@
+{
+  "name": "cortexium",
+  "version": "1.0.0",
+  "description": "A high-performance, reliable Node.js library for inter-service communication using Redis Streams.",
+  "main": "index.js",
+  "scripts": {
+    "test": "DEBUG=cortexium:* node performance-test.js",
+    "diagnose": "node diagnostics.js"
+  },
+  "author": "Bahi Hussein",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BahiHussein/Cortexium.git"
+  },
+  "keywords": [
+    "redis",
+    "streams",
+    "rpc",
+    "microservices",
+    "message-bus",
+    "real-time",
+    "pubsub"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "debug": "^4.3.4",
+    "ioredis": "^5.3.2",
+    "nanoid": "^3.3.4"
+  },
+  "devDependencies": {
+    "event-loop-lag": "^1.4.0"
+  }
+}
