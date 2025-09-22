@@ -11,6 +11,79 @@ Cortexium provides a simple and powerful API for building complex, distributed s
 - **Debuggable:** Includes detailed logging with the `debug` package to provide deep insight into the message flow.
 - **Extensible with Services:** Easily load and initialize service modules, such as a task scheduler, within a Cortexium node.
 
+# How Cortexium Works: A Simple Guide
+
+At its core, Cortexium is a communication system for your microservices. It lets your different services (which we call **nodes**) talk to each other reliably and efficiently, using Redis as a central message hub.
+
+Think of your entire application as a large, busy restaurant kitchen.
+
+- **Services (Nodes)** are like specialized chefs (e.g., the Grill Chef, the Sauce Chef).
+- **Redis** is the Head Chef who manages the order tickets.
+- **Messages** are the order tickets themselves.
+
+---
+
+## The Core Components
+
+### 1. Nodes
+
+A **node** is simply one of your services. When you start a service with Cortexium, you give it a `type`, like `'order-service'` or `'payment-service'`. This is like giving a chef a title. You can have multiple chefs with the same title (e.g., three Grill Chefs) to handle more work.
+
+### 2. Topics
+
+A **topic** is like a category of work. When one service needs another to do something, it sends a message to a specific topic. For example, the `order-service` might send a message to the `payment:process` topic.
+
+### 3. Two Types of Messages
+
+Cortexium sends two kinds of messages, just like a kitchen has two types of orders:
+
+- **Fire-and-Forget (`emit` without a callback):** This is like shouting an announcement in the kitchen, such as "8 salmon just arrived!" You don't expect a direct reply. You just send the information and move on. In Cortexium, you do this by calling `emit` without a callback function.
+- **Request/Reply (`emit` with a callback):** This is the most common type of message. It's like placing a specific order, such as "Grill one salmon for Table 5." You need a specific dish to come back to you. In Cortexium, you do this by providing a callback function to `emit`.
+
+---
+
+## The Communication Flow: A Tale of Two Messages
+
+Let's follow the journey of a message to see how Cortexium works its magic.
+
+### Scenario 1: Fire-and-Forget
+
+An `analytics-service` wants to log that a user has just signed in. It doesn't need a response.
+
+1. The `analytics-service` calls `emit('user:login', { userId: 123 });`.
+2. Cortexium packages the user data into a message and publishes it to the `user:login` topic on Redis Streams.
+3. A `logging-service`, which is subscribed to the `user:login` topic, receives the message and records it.
+4. That's it. The flow ends here.
+
+### Scenario 2: The Request/Reply Lifecycle (with `correlationId`)
+
+This is where the real power of Cortexium shines. An `api-gateway` needs to process a payment and must get a confirmation back.
+
+**Part 1: The Request**
+
+1. **Making the Request:** The `api-gateway` calls `emit` with a callback:JavaScript
+    
+    `apiNode.emit('payment:process', { amount: 50 }, (err, result) => {
+      // ... handle the reply later
+    });`
+    
+2. **Creating the "Ticket":** Because a callback is present, Cortexium knows a reply is expected. It immediately does two crucial things:
+    - It generates a unique **`correlationId`** (like `V1StGXR8_Z5jdHi6B-myT`). This is the unique ticket number for this specific request.
+    - It notes down the **`replyTo`** address, which is the private, unique channel for this specific `api-gateway` node.
+3. **Storing the Callback:** The `api-gateway` stores the callback function in a `Map`, using the `correlationId` as the key. It's now waiting for a reply with that specific ticket number.
+4. **Sending the Message:** The message is sent to the `payment:process` topic. It contains the payment data, the `correlationId`, and the `replyTo` address.
+
+**Part 2: The Reply**
+
+1. **Receiving the Work:** On the other side, one of the available `payment-service` nodes receives the message. Because multiple `payment-service` nodes might be running, Redis ensures only **one** of them gets this specific task (this is called load balancing).
+2. **Processing:** The `payment-service` executes its handler function, processes the payment, and `returns` a result, like `{ success: true, transactionId: 'xyz' }`.
+3. **Packaging the Reply:** Cortexium on the `payment-service` node sees the returned value. It also sees the `correlationId` and `replyTo` address from the original message. It packages the result into a new reply message, making sure to include the original `correlationId`.
+4. **Sending it Back:** The reply is sent directly to the private `replyTo` channel of the `api-gateway` that made the request.
+5. **Matching the Ticket:** The `api-gateway`'s `replyManager` receives the reply. It looks at the `correlationId` (`V1StGXR8_Z5jdHi6B-myT`) and finds the matching callback function it stored in its `replyHandlers` map earlier.
+6. **Completing the Cycle:** The callback is executed with the result, and the `api-gateway` can now continue its work. The `correlationId` is removed from the map to clean up.
+
+This entire process happens asynchronously, allowing the `api-gateway` to handle hundreds of other requests while waiting for the payment to be processed. The `correlationId` ensures that no matter how many requests and replies are flying around, each response is delivered to its correct origin.
+
 ## High-Level Architecture
 
 At its core, Cortexium uses Redis as a central message bus. Your services (nodes) connect to Cortexium and communicate with each other by publishing messages to topics (Redis Streams) and subscribing to topics to process them. This decouples your services, allowing them to be developed, deployed, and scaled independently.
@@ -107,7 +180,7 @@ Cortexium is designed to be extensible through services. These are modules that 
 
 ### Available Services
 
-- [**Scheduler](https://www.google.com/search?q=./services/scheduler/README.md):** A service that allows you to schedule tasks to be executed at a later time.
+- [**Scheduler](./docs/scheduler.md):** A service that allows you to schedule tasks to be executed at a later time.
 
 ## Performance & Diagnostics
 

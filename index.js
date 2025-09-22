@@ -1,6 +1,6 @@
 // cortexium/index.js
 const RedisManager = require('./redis-manager');
-const { nanoid } = require('nanoid');
+const { nanoid } = require('nanoid/non-secure');
 const { performance } = require('perf_hooks');
 const SchedulerModule = require('./services/scheduler/scheduler');
 
