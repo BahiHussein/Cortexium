@@ -9,6 +9,7 @@ Cortexium provides a simple and powerful API for building complex, distributed s
 - **Reliable Request/Reply:** Guarantees that replies to specific requests are delivered to the correct originating node, even in a scaled-out environment.
 - **Easy to Use:** A minimal API (`emit` and `sub`) makes it simple to send messages and subscribe to topics.
 - **Debuggable:** Includes detailed logging with the `debug` package to provide deep insight into the message flow.
+- **Extensible with Services:** Easily load and initialize service modules, such as a task scheduler, within a Cortexium node.
 
 ## High-Level Architecture
 
@@ -18,14 +19,7 @@ At its core, Cortexium uses Redis as a central message bus. Your services (nodes
 
 ### 1. Installation
 
-Add Cortexium's dependencies to your project's `package.json` and install them.
-
-```
-npm install ioredis nanoid debug event-loop-lag
-
-```
-
-Then, add the `index.js` and `redis-manager.js` files to your project.
+`npm install cortexium`
 
 ### 2. Running the RPC Example
 
@@ -35,10 +29,7 @@ The best way to understand Cortexium is to run the included example. It demonstr
 
 In your terminal, navigate to your project folder and run:
 
-```
-node examples/calculator-service.js
-
-```
+`node examples/calculator-service.js`
 
 You will see the output: `[Calculator] is online and ready.` This service is now listening for tasks on the `add` topic.
 
@@ -46,10 +37,7 @@ You will see the output: `[Calculator] is online and ready.` This service is now
 
 In a **second terminal**, run the API gateway:
 
-```
-node examples/api-gateway.js
-
-```
+`node examples/api-gateway.js`
 
 After a moment, you will see the gateway send its request and receive the correct result from the calculator service: `[API Gateway] SUCCESS! Result for 15 + 27 is 42`.
 
@@ -71,23 +59,17 @@ The included example demonstrates this perfectly. The `api-gateway` emits a task
 
 **Code Example (`api-gateway.js`):**
 
-```
-// A service emits to a general topic, like 'add'
+`// A service emits to a general topic, like 'add'
 apiNode.emit('add', [15, 27], (err, result) => {
     // ... handle reply
-});
-
-```
+});`
 
 **Code Example (`calculator-service.js`):**
 
-```
-// Any node of type 'calculator-service' can handle the request.
+`// Any node of type 'calculator-service' can handle the request.
 calculatorNode.sub('add', (numbers) => {
     return numbers[0] + numbers[1];
-});
-
-```
+});`
 
 ### 2. One-to-One (Direct Messaging)
 
@@ -95,8 +77,7 @@ Sometimes, you need to send a message to a *specific* instance of a service. For
 
 **Example: A service that can receive direct commands.**
 
-```
-// in a hypothetical monitoring-service.js
+`// in a hypothetical monitoring-service.js
 const Cortexium = require('./index');
 
 async function startMonitor() {
@@ -118,21 +99,24 @@ async function startMonitor() {
         }
     });
 }
-startMonitor();
+startMonitor();`
 
-```
+## Extending with Services
+
+Cortexium is designed to be extensible through services. These are modules that can be loaded into a Cortexium node to provide specific functionality.
+
+### Available Services
+
+- [**Scheduler](https://www.google.com/search?q=./services/scheduler/README.md):** A service that allows you to schedule tasks to be executed at a later time.
 
 ## Performance & Diagnostics
 
 The library includes scripts to help you test performance and diagnose potential issues. Make sure to define the `test` and `diagnose` scripts in your `package.json`:
 
-```
-"scripts": {
+`"scripts": {
   "test": "DEBUG=cortexium:* node performance-test.js",
   "diagnose": "node diagnostics.js"
-}
-
-```
+}`
 
 ### Running the Performance Test
 
@@ -140,10 +124,7 @@ The `performance-test.js` script simulates a high-throughput scenario where 100 
 
 To run the test:
 
-```
-npm run test
-
-```
+`npm run test`
 
 The output will show you two key metrics:
 
@@ -156,10 +137,7 @@ The Node.js event loop is single-threaded. If a piece of code blocks this thread
 
 To run the diagnostics:
 
-```
-npm run diagnose
-
-```
+`npm run diagnose`
 
 This will print an "Event Loop Lag" measurement every second. A healthy, non-blocking application will have a lag of less than 20ms. If you see this number spike, it's a sign that something is blocking the event loop.
 
@@ -173,6 +151,7 @@ Creates a new Cortexium node.
     - `prefix` `<string>` **Required.** A namespace for all Redis keys (e.g., `'my-app'`).
     - `url` `<string>` **Required.** The connection URL for your Redis server (e.g., `'redis://127.0.0.1:6379'`).
     - `type` `<string>` **Required.** The type of this service (e.g., `'order-service'`).
+    - `services` `<Array>` **Optional.** An array of service classes to load into the node.
 
 ### `cortexNode.ready()`
 
@@ -200,7 +179,7 @@ Publishes a message to a topic.
 
 ### `cortexNode.shutdown()`
 
-Returns a `Promise` that resolves after gracefully disconnecting from Redis.
+Returns a `Promise` that resolves after gracefully disconnecting from Redis and shutting down any loaded services.
 
 ## Architecture Deep Dive
 
@@ -215,17 +194,11 @@ Cortexium uses the `debug` library for detailed, namespaced logging. To see the 
 
 - **See all Cortexium logs:**
     
-    ```
-    DEBUG=cortexium:* node your-service.js
-    
-    ```
+    `DEBUG=cortexium:* node your-service.js`
     
 - **See only emit and reply logs:**
     
-    ```
-    DEBUG=cortexium:emit,cortexium:reply node your-service.js
-    
-    ```
+    `DEBUG=cortexium:emit,cortexium:reply node your-service.js`
     
 
 ## License
