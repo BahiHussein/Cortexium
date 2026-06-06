@@ -24,8 +24,9 @@ Cortexium provides a simple and powerful API for building complex, distributed s
   - [Broadcast Events](#2-broadcast-events)
   - [Promise-Based RPC](#3-promise-based-rpc)
   - [Middleware](#4-middleware)
+  - [Streaming RPC](#7-streaming-rpc)
 - [Extending with Services](#extending-with-services)
-- [Performance & Diagnostics](#performance--diagnostics)
+- [Testing & Performance](#testing--performance)
 - [API Reference](#api-reference)
 - [Architecture](#architecture)
 - [Debugging](#debugging)
@@ -264,23 +265,31 @@ await node.ready();
 
 ---
 
-## Performance & Diagnostics
+## Testing & Performance
 
-### Running the Performance Test
-
-```bash
-npm run test
-```
-
-The test simulates 100 concurrent RPC requests and reports throughput and latency.
-
-### Diagnosing Event Loop Issues
+Both suites run against a local NATS server (`nats-server -js`) and clean up after themselves.
 
 ```bash
-npm run diagnose
+npm test                  # reliability suite (29 checks)
+npm run test:performance  # performance suite (throughput, latency, streaming)
+npm run benchmark         # quick single-batch throughput benchmark
+npm run diagnose          # event-loop lag monitor during the benchmark
 ```
 
-Monitors event loop lag while the performance test runs. Healthy systems stay under 20ms.
+The **reliability suite** covers RPC correctness under load, structured error and timeout handling, load-balancing fairness, broadcast fan-out, middleware ordering, streaming RPC, and the multi-node scheduler (leader election, exactly-once firing, crash failover).
+
+### Measured performance
+
+From `npm run test:performance` against a single responder (NATS in Docker on macOS; a Linux host is faster):
+
+| Workload | Result |
+|---|---|
+| RPC throughput (200 concurrent) | ~33,000 ops/sec |
+| RPC latency (serial) | p50 ~0.1 ms |
+| RPC latency (200 concurrent) | p50 ~5 ms, p99 ~10 ms |
+| Sustained 10s @ 200 concurrent | ~33,000 ops/sec, 0 errors |
+| Broadcast fan-out | ~127,000 events/sec |
+| Streaming | ~230,000 chunks/sec |
 
 ---
 
@@ -382,8 +391,8 @@ Cortexium is built on **NATS**, a lightweight, high-performance messaging system
 | Load Balancing | Consumer groups (clunky) | Queue groups |
 | Broadcast | Not supported | Native Pub/Sub |
 | Wildcards | Not supported | `payments.*`, `payments.>` |
-| Throughput | ~1-2k ops/sec | ~18k+ ops/sec |
-| Latency | ~5-20ms | ~1-2ms |
+| Throughput | ~1-2k ops/sec | ~33k+ ops/sec |
+| Latency | ~5-20ms | sub-millisecond |
 | Retries/DLQ | Build from scratch | JetStream native |
 | Service Discovery | Build from scratch | Built-in |
 
