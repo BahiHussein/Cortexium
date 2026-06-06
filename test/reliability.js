@@ -335,6 +335,78 @@ async function testSchedulerChaos() {
     await Promise.all([...survivors.map((n) => n.shutdown()), recv.shutdown(), client.shutdown()]);
 }
 
+// ---- 10. Secondary API surface ----------------------------------------
+async function testSecondaryApi() {
+    console.log('\n--- 10. Secondary API surface ---');
+
+    // 10a: constructor validation (no server needed)
+    let e1 = null, e2 = null;
+    try { new Cortexium({ url: URL }); } catch (e) { e1 = e; }
+    try { new Cortexium({ type: 'x' }); } catch (e) { e2 = e; }
+    check('constructor requires type', /type/i.test(e1?.message || ''), e1?.message);
+    check('constructor requires url', /url/i.test(e2?.message || ''), e2?.message);
+
+    const prefix = uid('rel-api');
+    const worker = new Cortexium({ prefix, url: URL, type: 'api-worker' });
+    const client = new Cortexium({ prefix, url: URL, type: 'api-client' });
+    await Promise.all([worker.ready(), client.ready()]);
+
+    // 10b: emit() with callback (RPC reply via callback)
+    await worker.sub('echo', (p) => ({ got: p.n }));
+    const cb = await new Promise((resolve) => {
+        client.emit('echo', { n: 7 }, (err, result, duration) => resolve({ err, result, duration }));
+    });
+    check('emit() callback returns result', cb.result?.got === 7, JSON.stringify(cb.result));
+    check('emit() callback has no error', cb.err === null, String(cb.err));
+    check('emit() callback reports duration', cb.duration !== undefined && !isNaN(Number(cb.duration)), String(cb.duration));
+
+    // 10c: emit() fire-and-forget (no callback)
+    let ffGot = null;
+    await worker.sub('ff', (p) => { ffGot = p.v; });
+    await client.emit('ff', { v: 'fire' });
+    await sleep(250);
+    check('emit() fire-and-forget delivered', ffGot === 'fire', String(ffGot));
+
+    // 10d: ctx.reply() manual reply
+    await worker.sub('manual', (p, ctx) => { ctx.reply({ manual: true }); });
+    const manual = await client.request('manual', {});
+    check('ctx.reply() delivers a manual reply', manual?.manual === true, JSON.stringify(manual));
+
+    // 10e: ctx.publish() from inside a handler
+    let sideEffect = null;
+    await worker.subscribe('side', (p) => { sideEffect = p.from; });
+    await worker.sub('trigger', (p, ctx) => { ctx.publish('side', { from: 'handler' }); return 'ok'; });
+    const trig = await client.request('trigger', {});
+    await sleep(300);
+    check('handler still returns its RPC result', trig === 'ok', String(trig));
+    check('ctx.publish() emits a broadcast from a handler', sideEffect === 'handler', String(sideEffect));
+
+    // 10f: unsub() stops delivery
+    await worker.sub('temp', () => 'alive');
+    const before = await client.request('temp', {});
+    await worker.unsub('temp');
+    let afterErr = null;
+    try { await client.request('temp', {}, { timeout: 800 }); } catch (e) { afterErr = e; }
+    check('request works before unsub', before === 'alive', String(before));
+    check('unsub() stops the subscription', afterErr?.code === 'NO_RESPONDERS' || afterErr?.code === 'TIMEOUT', `got ${afterErr?.code}`);
+
+    // 10g: shutdown() idempotency
+    await worker.shutdown();
+    let dblErr = null;
+    try { await worker.shutdown(); } catch (e) { dblErr = e; }
+    check('shutdown() is idempotent', dblErr === null, String(dblErr));
+
+    // 10h: discover() finds active nodes of a type
+    const d1 = new Cortexium({ prefix, url: URL, type: 'discoverable' });
+    const d2 = new Cortexium({ prefix, url: URL, type: 'discoverable' });
+    await Promise.all([d1.ready(), d2.ready()]);
+    await sleep(900); // let heartbeats land in the discovery KV bucket
+    const found = await client.discover('discoverable');
+    check('discover() returns the active nodes', found.length === 2 && found.every((n) => n.nodeId), `found=${found.length}`);
+
+    await Promise.all([d1.shutdown(), d2.shutdown(), client.shutdown()]);
+}
+
 async function main() {
     console.log('========================================================');
     console.log(' CORTEXIUM RELIABILITY SUITE');
@@ -348,6 +420,7 @@ async function main() {
     await testStreaming();
     await testSchedulerRecovery();
     await testSchedulerChaos();
+    await testSecondaryApi();
 
     await cleanupBuckets();
 

@@ -270,7 +270,7 @@ await node.ready();
 Both suites run against a local NATS server (`nats-server -js`) and clean up after themselves.
 
 ```bash
-npm test                  # reliability suite (29 checks)
+npm test                  # reliability suite (42 checks)
 npm run test:performance  # performance suite (throughput, latency, streaming)
 npm run benchmark         # quick single-batch throughput benchmark
 npm run diagnose          # event-loop lag monitor during the benchmark
