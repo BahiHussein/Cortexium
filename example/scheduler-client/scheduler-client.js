@@ -1,37 +1,55 @@
-// cortexium/example/scheduler-client.js
 const Cortexium = require('../../index');
+const { Scheduler } = Cortexium.services;
 
-async function main() {
-    const schedulerClientNode = new Cortexium({
+async function startSchedulerService() {
+    const schedulerNode = new Cortexium({
         prefix: 'my-app',
-        url: 'redis://127.0.0.1:6379',
-        type: 'scheduler-client-service',
+        url: 'nats://127.0.0.1:4222',
+        type: 'scheduler-service',
+        services: [Scheduler]
     });
 
+    await schedulerNode.ready();
+    console.log('[Scheduler Service] is online and ready.');
+}
+
+async function startReceiver() {
     const receiverNode = new Cortexium({
         prefix: 'my-app',
-        url: 'redis://127.0.0.1:6379',
+        url: 'nats://127.0.0.1:4222',
         type: 'receiver-service',
     });
 
-    await Promise.all([schedulerClientNode.ready(), receiverNode.ready()]);
-    console.log('[Scheduler Client and Receiver] are online and ready.');
+    await receiverNode.ready();
+    console.log('[Receiver] is online and ready.');
 
-    receiverNode.sub('scheduled:task', (payload) => {
+    await receiverNode.sub('scheduled:task', (payload) => {
         console.log(`[Receiver] Received scheduled task with payload:`, payload);
-        console.log(`[Receiver] Task was scheduled at ${new Date(payload.scheduledAt).toLocaleTimeString()} and received at ${new Date().toLocaleTimeString()}`);
     });
-
-    function scheduleTask(topic, payload, delay) {
-        console.log(`[Scheduler Client] Scheduling task to topic "${topic}" in ${delay / 1000} seconds.`);
-        schedulerClientNode.emit('scheduler:add', {
-            topic,
-            payload: { ...payload, scheduledAt: new Date(Date.now() + delay).toISOString() },
-            delay,
-        });
-    }
-
-    scheduleTask('scheduled:task', { message: 'This is a scheduled message.' }, 5000); // 5 seconds
 }
 
-main();
+async function startClient() {
+    const clientNode = new Cortexium({
+        prefix: 'my-app',
+        url: 'nats://127.0.0.1:4222',
+        type: 'scheduler-client',
+    });
+
+    await clientNode.ready();
+    console.log('[Scheduler Client] is online and ready.');
+
+    // Schedule a task to be emitted in 5 seconds
+    setTimeout(() => {
+        console.log('[Scheduler Client] Scheduling task for 5 seconds from now...');
+        clientNode.emit('scheduler:add', {
+            topic: 'scheduled:task',
+            payload: { message: 'Hello from scheduled task!' },
+            delay: 5000,
+        });
+    }, 1000);
+}
+
+// Run all three in one script for demo
+startSchedulerService().catch(console.error);
+startReceiver().catch(console.error);
+startClient().catch(console.error);

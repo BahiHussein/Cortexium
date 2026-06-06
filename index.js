@@ -1,8 +1,11 @@
-// cortexium/index.js
-const RedisManager = require('./redis-manager');
+// cortexium/index.js - NATS-based implementation
 const { nanoid } = require('nanoid/non-secure');
 const { performance } = require('perf_hooks');
-const SchedulerModule = require('./services/scheduler/scheduler');
+
+const NatsTransport = require('./lib/transport');
+const Message = require('./lib/message');
+const MiddlewarePipeline = require('./lib/middleware');
+const ServiceDiscovery = require('./lib/discovery');
 
 const debug = {
     core: require('debug')('cortexium:core'),
@@ -11,42 +14,35 @@ const debug = {
     reply: require('debug')('cortexium:reply'),
 };
 
+/**
+ * Cortexium - A high-performance topic-based pub/sub + callback RPC system.
+ * Built on NATS for native request/reply, queue groups, and wildcards.
+ */
 class Cortexium {
-    constructor({ prefix, url, type, services = [] }) {
+    constructor(options = {}) {
+        const { prefix, url, type, services = [] } = options;
+
         if (!type) throw new Error('Node type must be defined');
+        if (!url) throw new Error('NATS URL must be defined');
 
         this.options = { prefix, url, type };
         this.nodeType = type;
         this.nodeId = nanoid();
-        this.replyHandlers = new Map();
+        this.isReady = false;
+        this.isShutdown = false;
+
+        this.transport = new NatsTransport({
+            url,
+            prefix,
+            nodeId: this.nodeId,
+            nodeType: type,
+        });
+
+        this.middleware = new MiddlewarePipeline();
+        this.discovery = new ServiceDiscovery(this.transport, this.nodeId, type, prefix);
         this.loadedServices = [];
+
         debug.core(`Initializing node ${this.nodeId} of type "${type}"`);
-
-        this.topicManager = new RedisManager({ prefix, url });
-        this.replyManager = new RedisManager({ prefix, url });
-
-        const replyTopic = `reply_to_${this.nodeId}`;
-        const replyGroup = `group_for_${this.nodeId}`;
-
-        this.replyManager.registerHandler(replyTopic, replyGroup, async (data) => {
-            const handler = this.replyHandlers.get(data.correlationId);
-            if (handler) {
-                data.timestamps.clientReceivedAt = performance.now();
-                debug.reply(`Received reply for correlationId: ${data.correlationId}`);
-                handler(data.error, data.payload, data.timestamps);
-                this.replyHandlers.delete(data.correlationId);
-            } else {
-                debug.reply(`Received unexpected reply for correlationId: ${data.correlationId}`);
-            }
-        });
-
-        this.replyManager.startConsuming(replyGroup).catch(err => {
-            debug.core(`[ERROR] Private reply consumer for ${this.nodeId} failed:`, err);
-        });
-
-        this.topicManager.startConsuming(this.nodeType).catch(err => {
-            debug.core(`[ERROR] Shared topic consumer for ${this.nodeType} failed:`, err);
-        });
 
         // Load and initialize services
         for (const ServiceClass of services) {
@@ -57,85 +53,248 @@ class Cortexium {
     }
 
     async ready() {
-        await Promise.all([
-            this.topicManager.ready,
-            this.replyManager.ready,
-        ]);
-        debug.core(`Node ${this.nodeId} is ready.`);
+        if (this.isReady) return;
+
+        await this.transport.connect();
+        await this.discovery.start();
+
+        // Mark ready before starting services: a service's start() may call
+        // node.sub()/subscribe(), which require the node to already be ready.
+        this.isReady = true;
+
         // Start all loaded services
         for (const service of this.loadedServices) {
             if (typeof service.start === 'function') {
-                service.start();
+                await service.start();
             }
         }
+
+        debug.core(`Node ${this.nodeId} is ready.`);
     }
 
-    sub(topic, handler) {
-        this.topicManager.registerHandler(topic, this.nodeType, async (data) => {
-            data.timestamps.serverReceivedAt = performance.now();
-            debug.sub(`Received message on topic "${topic}" from node ${data.sourceNode}`);
+    /**
+     * Register middleware for topic pattern matching.
+     * @param {string|RegExp|Function} pattern - Topic pattern or middleware function
+     * @param {Function} fn - async (ctx, next) => void
+     */
+    use(pattern, fn) {
+        this.middleware.use(pattern, fn);
+    }
 
-            const result = await handler(data.payload, data);
+    /**
+     * Subscribe to a topic for RPC (load-balanced across queue group).
+     * Only ONE node in the queue group will receive each message.
+     *
+     * @param {string} topic - Topic name
+     * @param {Function} handler - async (payload, ctx) => result
+     * @param {Object} options
+     * @param {string} options.queue - Override queue group (default: nodeType)
+     */
+    async sub(topic, handler, options = {}) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
 
-            if (data.replyTo) {
-                data.timestamps.serverRepliedAt = performance.now();
-                debug.sub(`Sending reply for correlationId ${data.correlationId} to topic ${data.replyTo}`);
-                this.topicManager.publish(data.replyTo, {
-                    correlationId: data.correlationId,
-                    payload: result,
-                    timestamps: data.timestamps,
+        const wrappedHandler = async (message, ctx) => {
+            const startTime = performance.now();
+            debug.sub(`[RPC] Received on "${topic}" from ${message.sourceNode} (correlationId: ${message.correlationId})`);
+
+            try {
+                const result = await this.middleware.execute(topic, message, ctx, async (msg, innerCtx) => {
+                    const result = await handler(msg.payload, innerCtx);
+                    // Return value is handled by transport auto-reply
+                    return result;
                 });
-            }
-        });
-    }
 
-    emit(topic, payload, callback) {
-        const message = {
-            payload,
-            sourceNode: this.nodeId,
-            timestamps: { clientSentAt: performance.now() },
+                const duration = (performance.now() - startTime).toFixed(2);
+                debug.sub(`[RPC] Handled "${topic}" in ${duration}ms`);
+                return result;
+            } catch (err) {
+                debug.sub(`[RPC] Handler error on "${topic}":`, err.message);
+                throw err; // Transport will convert to error reply
+            }
         };
 
-        if (callback) {
-            message.correlationId = nanoid();
-            message.replyTo = `reply_to_${this.nodeId}`;
+        await this.transport.subscribe(topic, wrappedHandler, {
+            queue: options.queue || this.nodeType,
+            broadcast: false,
+        });
 
-            debug.emit(`Emitting message to topic "${topic}" with reply expected (correlationId: ${message.correlationId})`);
+        debug.core(`Subscribed to RPC topic "${topic}" (queue: ${options.queue || this.nodeType})`);
+    }
 
-            this.replyHandlers.set(message.correlationId, (err, result, timestamps) => {
-                const totalDuration = (timestamps.clientReceivedAt - timestamps.clientSentAt).toFixed(2);
-                debug.emit(`Reply for correlationId ${message.correlationId} received. Total round-trip: ${totalDuration}ms`);
+    /**
+     * Subscribe to a topic for broadcast events.
+     * ALL active subscribers will receive each message.
+     *
+     * @param {string} topic - Topic name
+     * @param {Function} handler - async (payload, ctx) => void
+     */
+    async subscribe(topic, handler) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
 
-                if (err) return callback(new Error(err), null, totalDuration);
-                callback(null, result, totalDuration, timestamps);
-            });
+        const wrappedHandler = async (message, ctx) => {
+            debug.sub(`[Event] Received on "${topic}" from ${message.sourceNode}`);
 
-            setTimeout(() => {
-                if (this.replyHandlers.has(message.correlationId)) {
-                    debug.emit(`[ERROR] Request timed out for correlationId ${message.correlationId}`);
-                    this.replyHandlers.delete(message.correlationId);
-                    callback(new Error('Request timed out'));
+            try {
+                await this.middleware.execute(topic, message, ctx, async (msg, innerCtx) => {
+                    await handler(msg.payload, innerCtx);
+                });
+            } catch (err) {
+                debug.sub(`[Event] Handler error on "${topic}":`, err.message);
+                // Events don't have replies, just log
+            }
+        };
+
+        await this.transport.subscribe(topic, wrappedHandler, { broadcast: true });
+        debug.core(`Subscribed to broadcast topic "${topic}"`);
+    }
+
+    /**
+     * Unsubscribe from a topic.
+     */
+    async unsub(topic, options = {}) {
+        await this.transport.unsubscribe(topic, options);
+        debug.core(`Unsubscribed from "${topic}"`);
+    }
+
+    /**
+     * Publish a broadcast event (fire-and-forget).
+     * All subscribers receive this message.
+     *
+     * @param {string} topic - Topic name
+     * @param {*} payload - Message payload
+     */
+    async publish(topic, payload) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
+
+        const message = new Message({
+            topic,
+            type: 'event',
+            payload,
+            sourceNode: this.nodeId,
+        });
+
+        debug.emit(`Publishing event to "${topic}"`);
+        await this.transport.publish(topic, message);
+    }
+
+    /**
+     * Emit a message.
+     * - Without callback: fire-and-forget RPC (load-balanced, no reply expected)
+     * - With callback: RPC with callback reply
+     *
+     * @param {string} topic - Topic name
+     * @param {*} payload - Message payload
+     * @param {Function} [callback] - Optional callback (err, result, duration)
+     */
+    async emit(topic, payload, callback) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
+
+        const isRPC = typeof callback === 'function';
+
+        const message = new Message({
+            topic,
+            type: isRPC ? 'rpc' : 'event',
+            payload,
+            sourceNode: this.nodeId,
+            replyTo: isRPC ? `reply.${this.nodeId}` : undefined,
+        });
+
+        if (isRPC) {
+            debug.emit(`Emitting RPC to "${topic}" (correlationId: ${message.correlationId})`);
+            const startTime = performance.now();
+
+            try {
+                const reply = await this.transport.request(topic, message, { timeout: 5000 });
+                const duration = performance.now() - startTime;
+
+                if (reply.error) {
+                    const err = new Error(reply.error.message);
+                    err.code = reply.error.code;
+                    err.details = reply.error.details;
+                    debug.emit(`RPC error for ${message.correlationId}: ${err.message}`);
+                    callback(err, null, duration.toFixed(2));
+                } else {
+                    debug.emit(`RPC reply for ${message.correlationId} received (${duration.toFixed(2)}ms)`);
+                    callback(null, reply.payload, duration.toFixed(2));
                 }
-            }, 5000);
+            } catch (err) {
+                const duration = performance.now() - startTime;
+                debug.emit(`RPC failed for ${message.correlationId}: ${err.message}`);
+                callback(err, null, duration.toFixed(2));
+            }
         } else {
-            debug.emit(`Emitting fire-and-forget message to topic "${topic}"`);
+            debug.emit(`Emitting fire-and-forget to "${topic}"`);
+            await this.transport.publish(topic, message);
+        }
+    }
+
+    /**
+     * Promise-based RPC request.
+     * Modern alternative to emit() with callback.
+     *
+     * @param {string} topic - Topic name
+     * @param {*} payload - Message payload
+     * @param {Object} options
+     * @param {number} options.timeout - Timeout in ms (default: 5000)
+     * @returns {Promise<*>} - Reply payload
+     */
+    async request(topic, payload, options = {}) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
+
+        const message = new Message({
+            topic,
+            type: 'rpc',
+            payload,
+            sourceNode: this.nodeId,
+        });
+
+        debug.emit(`Request to "${topic}" (correlationId: ${message.correlationId})`);
+
+        const reply = await this.transport.request(topic, message, {
+            timeout: options.timeout || 5000,
+        });
+
+        if (reply.error) {
+            const err = new Error(reply.error.message);
+            err.code = reply.error.code;
+            err.details = reply.error.details;
+            throw err;
         }
 
-        this.topicManager.publish(topic, message);
+        return reply.payload;
+    }
+
+    /**
+     * Discover active nodes of a given type.
+     * @param {string} nodeType - Type of service to discover
+     * @returns {Promise<Array>} - List of active node info objects
+     */
+    async discover(nodeType) {
+        return this.discovery.discover(nodeType);
     }
 
     async shutdown() {
-        await Promise.all(this.loadedServices.map(service => {
+        if (this.isShutdown) return;
+        this.isShutdown = true;
+
+        // Shutdown services
+        await Promise.all(this.loadedServices.map(async (service) => {
             if (typeof service.shutdown === 'function') {
-                return service.shutdown();
+                await service.shutdown();
             }
         }));
-        await Promise.all([
-            this.topicManager.shutdown(),
-            this.replyManager.shutdown(),
-        ]);
+
+        await this.discovery.shutdown();
+        await this.transport.disconnect();
+
+        debug.core(`Node ${this.nodeId} shut down.`);
     }
 }
+
+// --- Services ---
+
+// Scheduler service is loaded from the existing path but will be updated
+const SchedulerModule = require('./services/scheduler/scheduler');
 
 Cortexium.services = {
     Scheduler: SchedulerModule,

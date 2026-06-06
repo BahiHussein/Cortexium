@@ -4,15 +4,25 @@ This directory contains services that can be loaded into a Cortexium node to pro
 
 ## Scheduler Service
 
-The `scheduler.js` service allows you to schedule tasks to be executed at a later time. It works by listening for new tasks on a specific topic, adding them to a Redis sorted set, and then polling that set for tasks that are due.
+The `scheduler.js` service allows you to schedule tasks to be executed at a later time. It is **multi-node safe by design**: you can run any number of scheduler nodes for high availability, and each task fires exactly once across the whole cluster. State lives in JetStream KV — no Redis or other external store is required.
 
 ### How it Works
 
-1. **Scheduling a Task:** To schedule a task, you `emit` a message to the `scheduler:add` topic. The payload of this message should be an object with the following properties:
-    - `topic`: The topic to which the task should be emitted when it's due.
+1. **Scheduling a Task:** To schedule a task, you `emit` a message to the `scheduler:add` topic. The payload should be an object with:
+    - `topic`: The topic the task is emitted to when it's due.
     - `payload`: The payload of the task.
-    - `delay`: The delay in milliseconds before the task should be executed.
-2. **Execution:** The scheduler service periodically checks for due tasks and, when a task is due, it `emit`s the task's payload to the specified topic.
+    - `delay`: The delay in milliseconds before execution.
+    - `id` (optional): A stable task id. If omitted, one is generated.
+
+    Any scheduler node may receive the request (load-balanced via queue group) and persists it to the shared KV bucket `<prefix>_scheduler_tasks`. The task is **not** tied to the node that received it.
+
+2. **Leader election:** Scheduler nodes contend for a lease in the KV bucket `<prefix>_scheduler_leader` (TTL ~6s, renewed every ~2s). Exactly one node holds the lease at a time — the **leader**. Other nodes are hot standbys.
+
+3. **Execution:** Only the leader arms in-memory timers (watching the KV bucket as the source of truth) and `emit`s tasks when due. Because a single node fires, each task fires **exactly once**. A task is removed from KV once it fires.
+
+4. **High availability / failover:** If the leader dies, its lease expires and a standby takes over within a few seconds, replays the pending tasks from KV, and resumes. Tasks that came due during the gap fire immediately on takeover. The fire path is fenced by leadership, so a node that has lost the lease stops firing — bounding any duplicate window to roughly one renewal interval. (For strict once-only semantics under pathological network partitions, make your consumers idempotent — this is inherent to any distributed scheduler.)
+
+5. **Standalone fallback:** If JetStream is unavailable, a single node runs as the permanent leader, in-memory only, and tasks are lost on restart.
 
 ### Usage
 
@@ -28,7 +38,7 @@ const { Scheduler } = Cortexium.services;
 async function startSchedulerService() {
     const schedulerNode = new Cortexium({
         prefix: 'my-app',
-        url: 'redis://127.0.0.1:6379',
+        url: 'nats://127.0.0.1:4222',
         type: 'scheduler-service',
         services: [Scheduler]
     });
@@ -50,13 +60,13 @@ JavaScript
 async function main() {
     const schedulerClientNode = new Cortexium({
         prefix: 'my-app',
-        url: 'redis://127.0.0.1:6379',
+        url: 'nats://127.0.0.1:4222',
         type: 'scheduler-client-service',
     });
 
     const receiverNode = new Cortexium({
         prefix: 'my-app',
-        url: 'redis://127.0.0.1:6379',
+        url: 'nats://127.0.0.1:4222',
         type: 'receiver-service',
     });
 
