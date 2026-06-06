@@ -199,6 +199,24 @@ async function main() {
         await Promise.all([...subs.map((s) => s.shutdown()), pub.shutdown()]);
     }
 
+    // ---- 7. Streaming throughput --------------------------------------
+    {
+        const CHUNKS = 50000;
+        console.log(`--- 7. Streaming throughput  (single stream of ${fmt(CHUNKS)} chunks) ---`);
+        await responder.sub('bigstream', (n, ctx) => {
+            const s = ctx.stream();
+            for (let i = 0; i < CHUNKS; i++) s.send({ i });
+            s.end();
+        });
+        await sleep(150);
+        let received = 0;
+        const t0 = process.hrtime.bigint();
+        for await (const _ of requestor.requestStream('bigstream', {}, { idleTimeout: 15000 })) received++;
+        const wallMs = ms(process.hrtime.bigint() - t0);
+        console.log(`  received:    ${fmt(received)} chunks (expected ${fmt(CHUNKS)})`);
+        console.log(`  throughput:  ${fmt((received / wallMs) * 1000)} chunks/sec (${fmt(wallMs)} ms)\n`);
+    }
+
     await Promise.all([responder.shutdown(), requestor.shutdown()]);
     await cleanupBuckets();
     console.log('========================================================');

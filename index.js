@@ -265,6 +265,36 @@ class Cortexium {
     }
 
     /**
+     * Streaming RPC request. Returns an async iterable that yields each chunk
+     * the handler streams via `ctx.stream()`, in order, until the stream ends.
+     *
+     * Additive to request(): use this when a handler produces multiple chunks.
+     * A handler that returns a single value still works (yields one item).
+     *
+     *   for await (const chunk of node.requestStream('export', query)) { ... }
+     *
+     * @param {string} topic - Topic name
+     * @param {*} payload - Message payload
+     * @param {Object} options
+     * @param {number} options.idleTimeout - Max ms between chunks (default 30000)
+     * @returns {AsyncIterable<*>}
+     * @throws {Error} with `.code` ('NO_RESPONDERS' | 'TIMEOUT' | handler code)
+     */
+    requestStream(topic, payload, options = {}) {
+        if (!this.isReady) throw new Error('Node not ready. Call await node.ready() first.');
+
+        const message = new Message({
+            topic,
+            type: 'stream',
+            payload,
+            sourceNode: this.nodeId,
+        });
+
+        debug.emit(`Stream request to "${topic}" (correlationId: ${message.correlationId})`);
+        return this.transport.requestStream(topic, message, options);
+    }
+
+    /**
      * Discover active nodes of a given type.
      * @param {string} nodeType - Type of service to discover
      * @returns {Promise<Array>} - List of active node info objects

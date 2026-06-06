@@ -187,9 +187,75 @@ async function testMiddleware() {
     await Promise.all([worker.shutdown(), client.shutdown()]);
 }
 
-// ---- 7. Scheduler: single-node crash recovery -------------------------
+// ---- 7. Streaming RPC (additive) --------------------------------------
+async function testStreaming() {
+    console.log('\n--- 7. Streaming RPC (additive feature) ---');
+    const prefix = uid('rel-stream');
+    const worker = new Cortexium({ prefix, url: URL, type: 'streamer' });
+    const client = new Cortexium({ prefix, url: URL, type: 'client' });
+    await Promise.all([worker.ready(), client.ready()]);
+
+    await worker.sub('count', (n, ctx) => {
+        const s = ctx.stream();
+        for (let i = 0; i < 5; i++) s.send({ i });
+        s.end();
+    });
+    await worker.sub('slowcount', async (n, ctx) => {
+        const s = ctx.stream();
+        for (let i = 0; i < 4; i++) { await sleep(30); s.send({ i }); } // emit over time
+        s.end();
+    });
+    await worker.sub('single', () => ({ value: 'one' }));
+    await worker.sub('boom', (p, ctx) => {
+        const s = ctx.stream();
+        s.send({ i: 0 });
+        s.send({ i: 1 });
+        throw Object.assign(new Error('stream broke'), { code: 'STREAM_FAIL' });
+    });
+    await worker.sub('stall', async (p, ctx) => {
+        ctx.stream().send({ i: 0 });
+        await new Promise(() => {}); // never ends -> client must idle-timeout
+    });
+    await sleep(150);
+
+    // 7a: all chunks, in order
+    const got = [];
+    for await (const c of client.requestStream('count', {})) got.push(c.i);
+    check('streamed all 5 chunks in order', got.join(',') === '0,1,2,3,4', `got=[${got.join(',')}]`);
+
+    // 7a-async: chunks emitted over time (handler stays pending) all arrive
+    const slow = [];
+    for await (const c of client.requestStream('slowcount', {})) slow.push(c.i);
+    check('async stream (chunks over time) delivers all', slow.join(',') === '0,1,2,3', `got=[${slow.join(',')}]`);
+
+    // 7b: one-shot request() sees only the first chunk (this is WHY requestStream exists)
+    const single = await client.request('count', {});
+    check('request() sees only first chunk (existing behavior unchanged)', single.i === 0, `got=${JSON.stringify(single)}`);
+
+    // 7c: requestStream against a normal handler yields exactly one value (compat)
+    const compat = [];
+    for await (const c of client.requestStream('single', {})) compat.push(c);
+    check('requestStream on non-streaming handler yields exactly 1', compat.length === 1 && compat[0].value === 'one', `got=${JSON.stringify(compat)}`);
+
+    // 7d: mid-stream error propagates, with chunks-before-error delivered
+    const partial = []; let streamErr = null;
+    try { for await (const c of client.requestStream('boom', {})) partial.push(c.i); }
+    catch (e) { streamErr = e; }
+    check('chunks before error were delivered', partial.join(',') === '0,1', `got=[${partial.join(',')}]`);
+    check('mid-stream error propagated with code', streamErr?.code === 'STREAM_FAIL', `got ${streamErr?.code}`);
+
+    // 7e: idle timeout when the handler stalls
+    let toErr = null;
+    try { for await (const _ of client.requestStream('stall', {}, { idleTimeout: 300 })) { /* consume */ } }
+    catch (e) { toErr = e; }
+    check('idle timeout fires when stream stalls', toErr?.code === 'TIMEOUT', `got ${toErr?.code}`);
+
+    await Promise.all([worker.shutdown(), client.shutdown()]);
+}
+
+// ---- 8. Scheduler: single-node crash recovery -------------------------
 async function testSchedulerRecovery() {
-    console.log('\n--- 7. Scheduler single-node crash recovery ---');
+    console.log('\n--- 8. Scheduler single-node crash recovery ---');
     const prefix = uid('rel-sched1');
     const sched = new Cortexium({ prefix, url: URL, type: 'scheduler-service', services: [Cortexium.services.Scheduler] });
     const recv = new Cortexium({ prefix, url: URL, type: 'recv' });
@@ -216,7 +282,7 @@ async function testSchedulerRecovery() {
 
 // ---- 8. Scheduler: multi-node exactly-once + chaos under load ----------
 async function testSchedulerChaos() {
-    console.log('\n--- 8. Scheduler multi-node chaos (kill leader under continuous load) ---');
+    console.log('\n--- 9. Scheduler multi-node chaos (kill leader under continuous load) ---');
     const prefix = uid('rel-sched2');
     const mk = () => new Cortexium({ prefix, url: URL, type: 'scheduler-service', services: [Cortexium.services.Scheduler] });
     const nodes = [mk(), mk(), mk()];
@@ -279,6 +345,7 @@ async function main() {
     await testLoadBalancing();
     await testBroadcast();
     await testMiddleware();
+    await testStreaming();
     await testSchedulerRecovery();
     await testSchedulerChaos();
 

@@ -215,6 +215,29 @@ console.log(calculators);
 // [{ nodeId: '...', nodeType: 'calculator-service', timestamp: 1717654800000 }]
 ```
 
+### 7. Streaming RPC
+
+For responses that arrive in multiple chunks (large result sets, progress updates, log tails), the handler streams via `ctx.stream()` and the caller consumes an async iterable.
+
+**Service (streaming handler):**
+```javascript
+await node.sub('export.users', async (query, ctx) => {
+    const stream = ctx.stream();
+    for await (const batch of db.scanUsers(query)) {
+        stream.send(batch);   // send each chunk as it's ready
+    }
+    stream.end();             // terminate the stream
+});
+```
+
+**Client:**
+```javascript
+for await (const batch of node.requestStream('export.users', { since: '2024-01-01' })) {
+    handle(batch);            // chunks arrive in order
+}
+// Errors thrown by the handler propagate out of the loop with their .code.
+```
+
 ---
 
 ## Extending with Services
@@ -318,6 +341,22 @@ Promise-based RPC.
 - `options.timeout` `<number>` Timeout in ms (default: `5000`).
 - Returns: `Promise<result>`
 - Throws: `Error` with `.code` property on failure.
+
+### `node.requestStream(topic, payload, options)`
+
+Streaming RPC. Returns an async iterable that yields each chunk the handler emits via `ctx.stream()`, in order, until the stream ends. Additive to `request()` — use it when a handler produces multiple chunks. A handler that returns a single value also works (yields one item).
+
+- `options.idleTimeout` `<number>` Max ms to wait between chunks (default: `30000`).
+- Returns: `AsyncIterable<chunk>`
+- Throws: `Error` with `.code` — `'NO_RESPONDERS'`, `'TIMEOUT'`, or the handler's error code (mid-stream errors propagate).
+
+```javascript
+for await (const chunk of node.requestStream('export.users', { since })) {
+    process(chunk);
+}
+```
+
+> Streaming uses core NATS (at-most-once delivery, same guarantee as `request()`), with no flow control — a very slow consumer buffers chunks in memory. For guaranteed/back-pressured delivery, JetStream is the upgrade path.
 
 ### `await node.discover(nodeType)`
 
